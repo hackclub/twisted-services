@@ -1,0 +1,5 @@
+fastapi>=0.115
+uvicorn[standard]>=0.34
+slack-bolt>=1.21
+aiohttp>=3.11
+pydantic>=2.9
