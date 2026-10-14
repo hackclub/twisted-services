@@ -154,7 +154,7 @@ docker run --rm --read-only -p 8000:8000 \
 ```
 
 The image runs from `/`, which always exists on the runtime filesystem, and
-starts with `python -m twisted_services.main`. The application creates its tables in the
+starts with `/usr/local/bin/python -m twisted_services.main`. The application creates its tables in the
 configured PostgreSQL database during startup and does not need to write to the
 container filesystem.
 

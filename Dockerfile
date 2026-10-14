@@ -12,4 +12,4 @@ COPY . .
 
 EXPOSE 8000
 
-CMD ["python", "-m", "twisted_services.main"]
+CMD ["/usr/local/bin/python", "twisted_services/main.py"]
