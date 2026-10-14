@@ -6,6 +6,7 @@ import json
 import os
 import re
 import secrets
+import sys
 import time
 import traceback
 from urllib.parse import urlencode
@@ -23,6 +24,11 @@ from slack_bolt.async_app import AsyncApp
 from slack_sdk.web.async_client import AsyncWebClient
 from starlette.responses import RedirectResponse
 from starlette.routing import Match
+
+# The deployment runner may invoke this file directly instead of using
+# `python -m twisted_services.main`; make the package root importable either way.
+if __package__ in (None, ""):
+	sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from twisted_services.storage import (
 	OAuthSession,
