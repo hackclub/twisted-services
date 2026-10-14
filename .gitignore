@@ -1,0 +1,9 @@
+# Local environment and run.sh runtime state
+.env
+.twisted-services.pid
+twisted-services.log
+twisted_services.db
+
+# Python runtime cache
+__pycache__/
+*.py[codz]

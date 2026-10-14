@@ -3,6 +3,11 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Twisted Services local runtime files
+.twisted-services.pid
+twisted-services.log
+twisted_services.db
+
 # C extensions
 *.so
 

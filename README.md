@@ -8,13 +8,23 @@ channels.
 
 - `GET /healthz` returns `{"status":"ok"}`.
 - `POST /slack/events` receives requests from Slack through Slack Bolt.
-- The `/twisted-ping` Slack command posts a message to the current channel.
+- The `/twisted-ping` (or `/twistedping`) Slack command opens a rich-text
+  composer for notifying here, the channel, or nobody, sending as the user or
+  Twisted, and scheduling delivery.
   The command is available only to the channel creator, except in the
   configured exempt channels.
+- The `/twisted-oauth` Slack command sends an ephemeral link to the OAuth login
+  page for enabling Send as User.
 - Errors can be posted to a Slack logging channel when `LOGGING_CHANNEL_ID`
   is configured.
 - A heartbeat message can be posted to the logging channel every 24 hours when
   `LOGGING_CHANNEL_ID` is configured.
+- `GET /oauth` signs in with Slack OAuth and stores the user token encrypted at
+  rest; `POST /oauth/send` sends a message as that user.
+- A message shortcut named `edit_twisted_message` lets channel managers and
+  members of `#twisters` edit messages sent by the bot.
+- Files attached to an `@Twisted` mention in `#twisters` are uploaded to R2 and
+  linked in the same thread.
 
 ## Configuration
 
@@ -32,12 +42,46 @@ running the application.
 | `SLACK_SIGNING_SECRET` | Recommended | — | Used by Slack Bolt to verify Slack requests. Without it, signed requests are acknowledged but cannot be verified. |
 | `LOGGING_CHANNEL_ID` | No | — | Slack channel for error logs and the daily heartbeat. |
 | `LOGGING_CC_USER_ID` | No | — | Optional Slack user ID to mention in error-log threads. |
+| `SLACK_CLIENT_ID` | For OAuth | — | Slack OAuth v2 client ID. |
+| `SLACK_CLIENT_SECRET` | For OAuth | — | Slack OAuth v2 client secret. Keep it out of source control. |
+| `SLACK_OAUTH_REDIRECT_URI` | For OAuth | — | Must exactly match the callback URL configured in Slack. |
+| `OAUTH_STATE_SECRET` | For OAuth | — | Long random secret used to sign OAuth state values. |
+| `OAUTH_TOKEN_ENCRYPTION_KEY` | For OAuth | — | Fernet key used to encrypt Slack user tokens in the database. |
+| `R2_ENDPOINT` | For uploads | — | Cloudflare R2 S3-compatible endpoint. |
+| `R2_ACCESS_KEY_ID` | For uploads | — | R2 access key. |
+| `R2_SECRET_ACCESS_KEY` | For uploads | — | R2 secret key. |
+| `R2_BUCKET` | For uploads | — | R2 bucket name. |
+| `R2_PUBLIC_BASE_URL` | No | `https://twisted.hackclub-assets.com` | Public URL prefix for uploaded files. |
+| `DATABASE_URL` | No | Local SQLite | Async SQLAlchemy URL. Use `postgresql+asyncpg://...` for PostgreSQL. |
 
 `AUTH_BEARER_TOKEN`, `SHIP_CHANNEL_ID`, and `MASTER_LOGGING_CHANNEL_ID` are
 retained for compatibility but are not used by any currently exposed
 endpoint.
 
+Generate the Fernet key with:
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
 ## Run locally
+
+The repository includes `run.sh`, which loads `.env`, starts the configured
+database when needed, and redeploys the bot by stopping the previous PID and
+starting a fresh process:
+
+```bash
+cp env.sample .env
+# Edit .env with your credentials.
+chmod +x run.sh
+./run.sh
+```
+
+SQLite requires no separate service. For PostgreSQL, set `DATABASE_URL` and
+use an externally managed database, or set `CREATE_DB_CONTAINER=true` along
+with `POSTGRES_PASSWORD` to let `run.sh` create or restart a local Docker
+container. Logs are written to `twisted-services.log`; the current PID is kept
+in `.twisted-services.pid`.
 
 ### Linux and macOS
 
@@ -97,6 +141,24 @@ docker run --rm -p 8000:8000 \
 
 ## HTTP endpoints
 
+### Slack OAuth
+
+Register `https://your-host.example/oauth/callback` as the Slack OAuth redirect
+URL and grant the user scopes `chat:write` and `im:write`. Open
+`https://your-host.example/oauth` in a browser to sign in. The callback sets an
+HttpOnly session cookie. Use that session to send as the signed-in user:
+
+```bash
+curl -b cookies.txt -c cookies.txt -L https://your-host.example/oauth
+curl -b cookies.txt -X POST https://your-host.example/oauth/send \
+  -H 'Content-Type: application/json' \
+  -d '{"target_id":"C0123456789","message":"Hello from OAuth"}'
+```
+
+`target_id` may be a channel (`C...` or `G...`) or a user (`U...`); user IDs
+are opened as direct messages. OAuth tokens are encrypted with Fernet before
+being written through SQLAlchemy.
+
 ### `GET /healthz`
 
 This endpoint does not require authentication:
@@ -132,11 +194,14 @@ Configure the Slack app to:
 
 1. Set the **Request URL** for events and slash commands to
    `https://your-host.example/slack/events`.
-2. Subscribe to the `app_mention` event if mention logging is required.
-3. Create the `/twisted-ping` slash command with the same request URL.
-4. Grant the bot the permissions required to read channel membership and post
+2. Subscribe to `app_mention`; file uploads require the mentioned message to
+  include its file payload.
+3. Create `/twisted-ping`, `/twistedping`, and `/twisted-oauth` with the same
+  request URL.
+4. Add a message shortcut with callback ID `edit_twisted_message`.
+5. Grant the bot the permissions required to read channel membership and post
    messages.
-5. Put the bot token and signing secret in the environment, not in source
+6. Put the bot token and signing secret in the environment, not in source
    control.
 
 Use `/twisted-ping here message` to notify the current channel with an
@@ -158,3 +223,5 @@ server is running.
 - Put the application behind HTTPS when it is reachable from the internet.
 - Restrict access to the logging channel and use the least-privileged Slack
   scopes needed by the bot.
+- Use PostgreSQL in production, set a strong `OAUTH_TOKEN_ENCRYPTION_KEY` and
+  `OAUTH_STATE_SECRET`, and keep both outside source control.

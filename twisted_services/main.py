@@ -1,11 +1,18 @@
 import asyncio
+import aiohttp
+import hashlib
+import hmac
+import json
 import os
 import re
+import secrets
+import time
 import traceback
+from urllib.parse import urlencode
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import uvicorn
@@ -13,7 +20,22 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, 
 from pydantic import BaseModel, Field
 from slack_bolt.adapter.fastapi.async_handler import AsyncSlackRequestHandler
 from slack_bolt.async_app import AsyncApp
+from slack_sdk.web.async_client import AsyncWebClient
+from starlette.responses import RedirectResponse
 from starlette.routing import Match
+
+from twisted_services.storage import (
+	OAuthSession,
+	SlackInstallation,
+	build_database,
+	decrypt_token,
+	encrypt_token,
+	find_installation,
+	find_session,
+	initialize_database,
+	new_session_token,
+	session_digest,
+)
 
 
 def load_dotenv_if_present(path: str = ".env") -> None:
@@ -60,11 +82,28 @@ class Settings:
 	logging_channel_id: str = os.getenv("LOGGING_CHANNEL_ID", "")
 	# Optional user id to cc in logging thread; set to empty to disable
 	logging_cc_user_id: str = os.getenv("LOGGING_CC_USER_ID", "")
+	oauth_client_id: str = os.getenv("SLACK_CLIENT_ID", "")
+	oauth_client_secret: str = os.getenv("SLACK_CLIENT_SECRET", "")
+	oauth_redirect_uri: str = os.getenv("SLACK_OAUTH_REDIRECT_URI", "")
+	oauth_state_secret: str = os.getenv("OAUTH_STATE_SECRET", "")
+	oauth_session_hours: int = int(os.getenv("OAUTH_SESSION_HOURS", "24"))
+	oauth_cookie_secure: bool = os.getenv("OAUTH_COOKIE_SECURE", "true").lower() == "true"
+	public_base_url: str = os.getenv("PUBLIC_BASE_URL", "")
+	r2_endpoint: str = os.getenv("R2_ENDPOINT", "")
+	r2_access_key_id: str = os.getenv("R2_ACCESS_KEY_ID", "")
+	r2_secret_access_key: str = os.getenv("R2_SECRET_ACCESS_KEY", "")
+	r2_bucket: str = os.getenv("R2_BUCKET", "")
+	r2_public_base_url: str = os.getenv("R2_PUBLIC_BASE_URL", "https://twisted.hackclub-assets.com")
 
 class SlackDispatchResult(BaseModel):
 	ok: bool
 	channel: str
 	ts: str | None = None
+
+
+class OAuthSendRequest(BaseModel):
+	target_id: str = Field(min_length=1)
+	message: str = Field(min_length=1, max_length=40000)
 
 
 def _truncate_message(value: str, limit: int = 3000) -> str:
@@ -178,6 +217,29 @@ def verify_bearer_token(
 		)
 
 
+def _oauth_state(settings: Settings) -> str:
+	if not settings.oauth_state_secret:
+		raise HTTPException(status_code=503, detail="Server missing OAUTH_STATE_SECRET")
+	payload = f"{int(time.time())}.{secrets.token_urlsafe(24)}"
+	signature = hmac.new(settings.oauth_state_secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+	return f"{payload}.{signature}"
+
+
+def _verify_oauth_state(value: str, settings: Settings) -> bool:
+	parts = value.split(".")
+	if len(parts) != 3 or not settings.oauth_state_secret:
+		return False
+	payload = ".".join(parts[:2])
+	try:
+		created = int(parts[0])
+	except ValueError:
+		return False
+	if abs(time.time() - created) > 600:
+		return False
+	expected = hmac.new(settings.oauth_state_secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+	return hmac.compare_digest(expected, parts[2])
+
+
 class SlackRelay:
 	# Channels exempt from channel manager check for /twisted-ping
 	TWISTED_PING_EXEMPT_CHANNELS = [
@@ -189,27 +251,65 @@ class SlackRelay:
 
 	def __init__(self, settings: Settings) -> None:
 		self.settings = settings
-		self.app = AsyncApp(
-			token=settings.slack_bot_token,
-			signing_secret=settings.slack_signing_secret,
-		)
+		# The app uses custom OAuth routes below, while Bolt itself uses one
+		# configured bot token. Hide OAuth env vars during construction so
+		# Bolt does not auto-enable multi-workspace installation lookup.
+		oauth_environment = {
+			key: os.environ.pop(key, None)
+			for key in ("SLACK_CLIENT_ID", "SLACK_CLIENT_SECRET")
+		}
+		try:
+			self.app = AsyncApp(
+				token=settings.slack_bot_token,
+				signing_secret=settings.slack_signing_secret,
+			)
+		finally:
+			for key, value in oauth_environment.items():
+				if value is not None:
+					os.environ[key] = value
 		self.handler = AsyncSlackRequestHandler(self.app)
 		self._register_default_handlers()
 
 	def _register_default_handlers(self) -> None:
-		@self.app.action(re.compile(".*"))
-		async def _ack_any_action(ack) -> None:
-			await ack()
-
 		@self.app.command("/twisted-ping")
 		async def handle_twisted_ping(ack, command, client, say) -> None:
 			await ack()
 			await self._process_twisted_ping(command, client, say)
 
+		@self.app.command("/twistedping")
+		async def handle_twistedping_alias(ack, command, client, say) -> None:
+			await ack()
+			await self._process_twisted_ping(command, client, say)
+
+		@self.app.command("/twisted-oauth")
+		async def handle_twisted_oauth(ack) -> None:
+			base_url = self.settings.public_base_url or self.settings.oauth_redirect_uri.removesuffix("/oauth/callback").rstrip("/")
+			if not base_url or not self.settings.oauth_client_id:
+				await ack(response_type="ephemeral", text="OAuth is not configured. Set SLACK_CLIENT_ID and SLACK_OAUTH_REDIRECT_URI first.")
+				return
+			await ack(response_type="ephemeral", text=f"<{base_url}/oauth|Connect your Slack account> to enable Send as User.")
+
+		@self.app.shortcut("edit_twisted_message")
+		async def handle_edit_shortcut(ack, shortcut, client) -> None:
+			await ack()
+			await self._open_edit_modal(shortcut, client)
+
+		@self.app.view("twisted_ping_modal")
+		async def handle_ping_submission(ack, body, view, client) -> None:
+			await ack()
+			await self._submit_ping_modal(body, view, client)
+
+		@self.app.view("twisted_edit_modal")
+		async def handle_edit_submission(ack, body, view, client) -> None:
+			await ack()
+			await self._submit_edit_modal(body, view, client)
+
 		@self.app.event("app_mention")
-		async def handle_message_events(body, logger) -> None:
-			"""Handle message events (logs for now; can be extended later)."""
-			logger.info(f"Message event received: {body.get('event', {}).get('type')}")
+		async def handle_message_events(body, client, logger) -> None:
+			event = body.get("event", {})
+			logger.info(f"Message event received: {event.get('type')}")
+			if event.get("files"):
+				await self._upload_mentioned_files(event, client)
 
 	async def _is_channel_manager(self, channel_id: str, user_id: str) -> bool:
 		"""Check if a user is a channel manager for the given channel."""
@@ -231,36 +331,10 @@ class SlackRelay:
 			return False
 
 	async def _process_twisted_ping(self, command: dict[str, Any], client: Any, say: Any) -> None:
-		"""Process /twisted-ping command."""
+		"""Authorize the command before opening the composer modal."""
 		try:
-			# Parse command text: [channel/here] [msg can be multiline]
-			text = command.get("text", "").strip()
-			if not text:
-				await client.chat_postEphemeral(
-					channel=command["channel_id"],
-					user=command["user_id"],
-					text="Usage: `/twisted-ping [channel/here] [message]`",
-				)
-				return
-
-			# Split text to get channel and message
-			parts = text.split(None, 1)  # Split on first whitespace
-			
-			channel_spec = parts[0]
-			message = parts[1] if len(parts) > 1 else "(no message)"
-
-			# Resolve channel
 			target_channel = command["channel_id"]
-
-			# Remove < > if channel is formatted as <#C123456> 
-			if channel_spec.lower() == "here":
-				message = f"<!here> {message}"
-			else:
-				message = f"<!channel> {message}"
-
-			# Check if channel is exempt from CM check
 			if target_channel not in self.TWISTED_PING_EXEMPT_CHANNELS:
-				# Check if user is channel manager
 				is_cm = await self._is_channel_manager(target_channel, command["user_id"])
 				if not is_cm:
 					await client.chat_postEphemeral(
@@ -269,22 +343,7 @@ class SlackRelay:
 						text=":loll:You are not a channel manager. Only channel managers can use `/twisted-ping` in this channel.",
 					)
 					return
-
-			blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": message}}]
-			# Fetch user's profile for name and avatar
-			user_info = await self.app.client.users_info(user=command["user_id"])
-			user_profile = user_info.get("user", {})
-			user_name = user_profile.get("profile", {}).get("display_name") or user_profile.get("real_name", "Unknown")
-			user_avatar = user_profile.get("profile", {}).get("image_512") or user_profile.get("profile", {}).get("image_original", "")
-
-			# Send message to target channel
-			await client.chat_postMessage(
-				channel=target_channel,
-				text=message,
-				blocks=blocks,
-				username=user_name,
-				icon_url=user_avatar,
-			)
+			await client.views_open(trigger_id=command["trigger_id"], view=self._ping_modal(command))
 		except Exception as exc:
 			await client.chat_postEphemeral(
 				channel=command["channel_id"],
@@ -295,6 +354,177 @@ class SlackRelay:
 				"Error in /twisted-ping command",
 				detail=f"Command: {command}\n\nError:\n{traceback.format_exc()}",
 			)
+
+	@staticmethod
+	def _ping_modal(command: dict[str, Any]) -> dict[str, Any]:
+		return {
+			"type": "modal", "callback_id": "twisted_ping_modal",
+			"private_metadata": json.dumps({"channel_id": command["channel_id"], "team_id": command.get("team_id", ""), "user_id": command["user_id"]}),
+			"title": {"type": "plain_text", "text": "Twisted message"}, "submit": {"type": "plain_text", "text": "Send"}, "close": {"type": "plain_text", "text": "Cancel"},
+			"blocks": [
+				{"type": "input", "block_id": "message", "label": {"type": "plain_text", "text": "Message"}, "element": {"type": "plain_text_input", "action_id": "value", "multiline": True, "max_length": 3000}},
+				{"type": "input", "block_id": "send_as", "label": {"type": "plain_text", "text": "Send as"}, "element": {"type": "radio_buttons", "action_id": "value", "options": [{"text": {"type": "plain_text", "text": "User"}, "value": "user"}, {"text": {"type": "plain_text", "text": "Twisted - YSWS"}, "value": "anon"}], "initial_option": {"text": {"type": "plain_text", "text": "Twisted - YSWS"}, "value": "anon"}}},
+				{"type": "input", "block_id": "schedule", "optional": True, "label": {"type": "plain_text", "text": "Schedule message"}, "element": {"type": "checkboxes", "action_id": "enabled", "options": [{"text": {"type": "plain_text", "text": "Send later"}, "value": "yes"}]}},
+				{"type": "input", "block_id": "schedule_time", "optional": True, "label": {"type": "plain_text", "text": "When"}, "element": {"type": "datetimepicker", "action_id": "value"}},
+			],
+		}
+
+	@staticmethod
+	def _rich_text_to_mrkdwn(value: dict[str, Any]) -> str:
+		if isinstance(value, str):
+			return value.strip()
+		if not isinstance(value, dict):
+			return ""
+		for nested_key in ("value", "rich_text_value"):
+			nested = value.get(nested_key)
+			if nested is not None and nested is not value:
+				return SlackRelay._rich_text_to_mrkdwn(nested)
+
+		def render(elements: list[dict[str, Any]]) -> str:
+			parts: list[str] = []
+			for element in elements:
+				kind = element.get("type")
+				if kind == "text":
+					text = element.get("text", "")
+					style = element.get("style", {})
+					if style.get("bold"): text = f"*{text}*"
+					if style.get("italic"): text = f"_{text}_"
+					if style.get("strike"): text = f"~{text}~"
+					if style.get("code"): text = f"`{text}`"
+					parts.append(text)
+				elif kind == "link":
+					parts.append(f"<{element.get('url', '')}|{element.get('text') or element.get('url', '')}>")
+				elif kind == "user":
+					parts.append(f"<@{element.get('user_id')}>")
+				elif kind == "broadcast":
+					target = element.get("range", "channel")
+					if target == "everyone": target = "channel"
+					parts.append(f"<!{target}|{target}>")
+				elif kind == "emoji":
+					parts.append(f":{element.get('name') or element.get('unicode') or ''}:")
+				elif kind in {"rich_text_section", "rich_text_preformatted", "rich_text_quote"}:
+					content = render(element.get("elements", []))
+					if kind == "rich_text_preformatted": content = f"```{content}```"
+					if kind == "rich_text_quote": content = "\n".join(f"> {line}" for line in content.splitlines())
+					parts.append(content)
+				elif kind == "rich_text_list":
+					style = element.get("style", "bullet")
+					items = []
+					for index, item in enumerate(element.get("elements", []), start=1):
+						prefix = f"{index}. " if style == "ordered" else "• "
+						items.append(prefix + render(item.get("elements", [])))
+					parts.append("\n".join(items))
+				if kind in {"rich_text_section", "rich_text_preformatted", "rich_text_quote", "rich_text_list"}:
+					parts.append("\n")
+			return "".join(parts)
+
+		return render(value.get("elements", [])).strip()
+
+	@staticmethod
+	def _view_value(view: dict[str, Any], block_id: str, action_id: str = "value") -> Any:
+		return view.get("state", {}).get("values", {}).get(block_id, {}).get(action_id, {})
+
+	async def _submit_ping_modal(self, body: dict[str, Any], view: dict[str, Any], client: Any) -> None:
+		metadata = json.loads(view.get("private_metadata", "{}"))
+		rich_value = self._view_value(view, "message")
+		message = self._rich_text_to_mrkdwn(rich_value) or "(no message)"
+		send_as = self._view_value(view, "send_as").get("selected_option", {}).get("value", "anon")
+		schedule_enabled = bool(self._view_value(view, "schedule", "enabled").get("selected_options"))
+		schedule_value = self._view_value(view, "schedule_time").get("selected_date_time")
+		message_kwargs: dict[str, Any] = {
+			"channel": metadata["channel_id"],
+			"text": message,
+			"blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": message, "verbatim": False}}],
+		}
+		identity_kwargs: dict[str, Any] = {}
+		if send_as == "user":
+			user_client = await self._oauth_client(metadata["team_id"], metadata["user_id"])
+			if user_client is not None:
+				client = user_client
+			else:
+				profile = (await self.app.client.users_info(user=metadata["user_id"])).get("user", {}).get("profile", {})
+				identity_kwargs.update(username=profile.get("display_name") or profile.get("real_name", "Unknown"), icon_url=profile.get("image_512") or profile.get("image_original", ""))
+		else:
+			identity_kwargs.update(username="Twisted - YSWS", icon_url="https://docs.twisted.hackclub.com/assets/favicon.png")
+		message_kwargs.update(identity_kwargs)
+		if schedule_enabled:
+			if not schedule_value:
+				await client.chat_postEphemeral(channel=metadata["channel_id"], user=metadata["user_id"], text="Choose a date and time for the scheduled message.")
+				return
+			await client.chat_scheduleMessage(**message_kwargs, post_at=int(schedule_value))
+		else:
+			await client.chat_postMessage(**message_kwargs)
+
+	async def _oauth_client(self, team_id: str, user_id: str) -> AsyncWebClient | None:
+		if not team_id: return None
+		async with db_sessionmaker() as database:
+			installation = await find_installation(database, team_id, user_id)
+		if installation is None: return None
+		return AsyncWebClient(token=decrypt_token(installation.token_ciphertext))
+
+	async def _can_edit_bot_message(self, channel_id: str, user_id: str) -> bool:
+		return channel_id == "C0AD3HRV4F8" or await self._is_channel_manager(channel_id, user_id)
+
+	async def _open_edit_modal(self, shortcut: dict[str, Any], client: Any) -> None:
+		channel = shortcut.get("channel", {})
+		message = shortcut.get("message", {})
+		channel_id = channel.get("id", "")
+		user_id = shortcut.get("user", {}).get("id", "")
+		if not message.get("bot_id") and message.get("subtype") != "bot_message":
+			await client.chat_postEphemeral(channel=channel_id, user=user_id, text="Only messages sent by Twisted can be edited.")
+			return
+		if not await self._can_edit_bot_message(channel_id, user_id):
+			await client.chat_postEphemeral(channel=channel_id, user=user_id, text="Only a channel manager or a member of #twisters can edit Twisted messages.")
+			return
+		initial = {"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": [{"type": "text", "text": message.get("text", "")}]}]}
+		await client.views_open(
+			trigger_id=shortcut["trigger_id"],
+			view={
+				"type": "modal", "callback_id": "twisted_edit_modal",
+				"private_metadata": json.dumps({"channel_id": channel_id, "message_ts": message.get("ts", "")}),
+				"title": {"type": "plain_text", "text": "Edit Twisted message"}, "submit": {"type": "plain_text", "text": "Save"}, "close": {"type": "plain_text", "text": "Cancel"},
+				"blocks": [{"type": "input", "block_id": "message", "label": {"type": "plain_text", "text": "Message"}, "element": {"type": "rich_text_input", "action_id": "value", "initial_value": initial}}],
+			},
+		)
+
+	async def _submit_edit_modal(self, body: dict[str, Any], view: dict[str, Any], client: Any) -> None:
+		metadata = json.loads(view.get("private_metadata", "{}"))
+		user_id = body.get("user", {}).get("id", "")
+		if not await self._can_edit_bot_message(metadata["channel_id"], user_id):
+			return
+		message = self._rich_text_to_mrkdwn(self._view_value(view, "message")) or "(no message)"
+		await client.chat_update(channel=metadata["channel_id"], ts=metadata["message_ts"], text=message, blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": message}}])
+
+	@staticmethod
+	def _slugify_filename(filename: str) -> str:
+		base, extension = os.path.splitext(filename)
+		slug = re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-") or "file"
+		return f"{slug}{extension.lower()}"
+
+	async def _upload_mentioned_files(self, event: dict[str, Any], client: Any) -> None:
+		settings = self.settings
+		if event.get("channel") != "C0AD3HRV4F8" or not all((settings.r2_endpoint, settings.r2_access_key_id, settings.r2_secret_access_key, settings.r2_bucket)):
+			return
+		channel_id = event.get("channel", "")
+		thread_ts = event.get("thread_ts") or event.get("ts")
+		for file_info in event.get("files", []):
+			status = await client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=f"Uploading `{file_info.get('name', 'file')}`...")
+			try:
+				async with aiohttp.ClientSession() as session:
+					async with session.get(file_info["url_private_download"], headers={"Authorization": f"Bearer {settings.slack_bot_token}"}) as response:
+						response.raise_for_status()
+						content = await response.read()
+				key = f"{secrets.token_urlsafe(12)}/{self._slugify_filename(file_info.get('name', 'file'))}"
+				await asyncio.to_thread(self._put_r2_object, key, content, file_info.get("mimetype", "application/octet-stream"))
+				url = f"{settings.r2_public_base_url.rstrip('/')}/{key}"
+				await client.chat_update(channel=channel_id, ts=status["ts"], text=url, blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": f"Uploaded: <{url}|{file_info.get('name', 'file')}>"}}])
+			except Exception as exc:
+				await client.chat_update(channel=channel_id, ts=status.get("ts"), text=f"Upload failed: {str(exc)[:200]}")
+
+	def _put_r2_object(self, key: str, content: bytes, content_type: str) -> None:
+		import boto3
+		r2 = boto3.client("s3", endpoint_url=self.settings.r2_endpoint, aws_access_key_id=self.settings.r2_access_key_id, aws_secret_access_key=self.settings.r2_secret_access_key, region_name="auto")
+		r2.put_object(Bucket=self.settings.r2_bucket, Key=key, Body=content, ContentType=content_type)
 
 	@staticmethod
 	def _thread_detail_messages(detail: str | None, limit: int = 3500) -> list[str]:
@@ -370,6 +600,7 @@ async def bot_heartbeat_task(settings: Settings, slack_relay: SlackRelay) -> Non
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 	"""Manage app startup and shutdown, including background tasks."""
+	await initialize_database(db_engine)
 	task = None
 	if settings.logging_channel_id:
 		task = asyncio.create_task(bot_heartbeat_task(settings, slack_relay))
@@ -380,10 +611,12 @@ async def lifespan(app: FastAPI):
 			await task
 		except asyncio.CancelledError:
 			pass
+	await db_engine.dispose()
 
 
 settings = get_settings()
 slack_relay = SlackRelay(settings)
+db_engine, db_sessionmaker = build_database()
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
 
@@ -435,6 +668,124 @@ async def error_logging_middleware(request: Request, call_next):
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
 	return {"status": "ok"}
+
+
+@app.get("/oauth")
+async def oauth_login() -> RedirectResponse:
+	if not settings.oauth_client_id or not settings.oauth_redirect_uri:
+		raise HTTPException(status_code=503, detail="Slack OAuth is not configured")
+	state = _oauth_state(settings)
+	query = urlencode({
+		"client_id": settings.oauth_client_id,
+		"redirect_uri": settings.oauth_redirect_uri,
+		"user_scope": "chat:write,im:write",
+		"state": state,
+	})
+	return RedirectResponse(f"https://slack.com/oauth/v2/authorize?{query}", status_code=307)
+
+
+@app.get("/oauth/callback")
+async def oauth_callback(request: Request) -> Response:
+	if not settings.oauth_client_id or not settings.oauth_client_secret or not settings.oauth_redirect_uri:
+		raise HTTPException(status_code=503, detail="Slack OAuth is not configured")
+	if not _verify_oauth_state(request.query_params.get("state", ""), settings):
+		raise HTTPException(status_code=400, detail="Invalid or expired OAuth state")
+	code = request.query_params.get("code", "")
+	if not code:
+		raise HTTPException(status_code=400, detail="Slack OAuth did not return a code")
+
+	try:
+		async with aiohttp.ClientSession() as client:
+			async with client.post(
+				"https://slack.com/api/oauth.v2.access",
+				data={
+					"client_id": settings.oauth_client_id,
+					"client_secret": settings.oauth_client_secret,
+					"code": code,
+					"redirect_uri": settings.oauth_redirect_uri,
+				},
+			) as slack_response:
+				payload = await slack_response.json()
+	except Exception as exc:
+		raise HTTPException(status_code=502, detail="Unable to contact Slack OAuth") from exc
+	if not payload.get("ok") or not payload.get("authed_user", {}).get("access_token"):
+		raise HTTPException(status_code=502, detail="Slack OAuth authorization failed")
+
+	team_id = payload.get("team", {}).get("id")
+	slack_user_id = payload.get("authed_user", {}).get("id")
+	if not team_id or not slack_user_id:
+		raise HTTPException(status_code=502, detail="Slack OAuth response was missing team or user")
+	async with db_sessionmaker() as database:
+		installation = await find_installation(database, team_id, slack_user_id)
+		if installation is None:
+			installation = SlackInstallation(
+				team_id=team_id,
+				slack_user_id=slack_user_id,
+				token_ciphertext=encrypt_token(payload["authed_user"]["access_token"]),
+			)
+			session_token = new_session_token()
+			database.add(installation)
+		else:
+			installation.token_ciphertext = encrypt_token(payload["authed_user"]["access_token"])
+			session_token = new_session_token()
+		database.add(OAuthSession(
+			session_hash=session_digest(session_token),
+			team_id=team_id,
+			slack_user_id=slack_user_id,
+			expires_at=datetime.now(ZoneInfo("UTC")) + timedelta(hours=settings.oauth_session_hours),
+		))
+		await database.commit()
+	response = Response(content="Slack OAuth login complete. You can now call /oauth/send.", media_type="text/plain")
+	response.set_cookie(
+		"twisted_oauth_session",
+		session_token,
+		max_age=settings.oauth_session_hours * 3600,
+		httponly=True,
+		secure=settings.oauth_cookie_secure,
+		samesite="lax",
+	)
+	return response
+
+
+async def oauth_session(request: Request) -> OAuthSession:
+	token = request.cookies.get("twisted_oauth_session")
+	if not token:
+		raise HTTPException(status_code=401, detail="Sign in at /oauth first")
+	async with db_sessionmaker() as database:
+		session = await find_session(database, token)
+	if session is None:
+		raise HTTPException(status_code=401, detail="OAuth session is missing or expired")
+	return session
+
+
+@app.get("/oauth/me")
+async def oauth_me(session: OAuthSession = Depends(oauth_session)) -> dict[str, str]:
+	return {"team_id": session.team_id, "slack_user_id": session.slack_user_id}
+
+
+@app.post("/oauth/send", response_model=SlackDispatchResult)
+async def oauth_send(
+	payload: OAuthSendRequest,
+	session: OAuthSession = Depends(oauth_session),
+) -> SlackDispatchResult:
+	async with db_sessionmaker() as database:
+		installation = await find_installation(database, session.team_id, session.slack_user_id)
+	if installation is None:
+		raise HTTPException(status_code=401, detail="Slack OAuth installation not found")
+	try:
+		client = AsyncWebClient(token=decrypt_token(installation.token_ciphertext))
+		target = payload.target_id
+		if target.startswith("U"):
+			opened = await client.conversations_open(users=target)
+			target = opened["channel"]["id"]
+		elif not (target.startswith("C") or target.startswith("G")):
+			raise HTTPException(status_code=400, detail="target_id must start with U, C, or G")
+		result = await client.chat_postMessage(channel=target, text=payload.message)
+	except HTTPException:
+		raise
+	except Exception as exc:
+		raise HTTPException(status_code=502, detail="Slack message delivery failed") from exc
+	return SlackDispatchResult(ok=bool(result.get("ok")), channel=target, ts=result.get("ts"))
 
 
 @app.post("/slack/events", status_code=200)
