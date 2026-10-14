@@ -1,6 +1,9 @@
-FROM python:3.13
+FROM python:3.13-slim
 
-WORKDIR /twisted_services
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+	PYTHONUNBUFFERED=1
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -9,4 +12,4 @@ COPY . .
 
 EXPOSE 8000
 
-CMD ["python", "twisted_services/main.py"]
+CMD ["python", "-m", "twisted_services.main"]

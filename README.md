@@ -139,6 +139,25 @@ docker run --rm -p 8000:8000 \
   twisted-services
 ```
 
+For a read-only container filesystem, use PostgreSQL and inject the database
+URL at runtime. Do not use `run.sh` inside the container because it writes a
+PID file and log file; `run.sh` is for local Codespaces only.
+
+```bash
+docker run --rm --read-only -p 8000:8000 \
+  -e SLACK_BOT_TOKEN="$SLACK_BOT_TOKEN" \
+  -e SLACK_SIGNING_SECRET="$SLACK_SIGNING_SECRET" \
+  -e DATABASE_URL="postgresql+asyncpg://user:password@postgres-host:5432/twisted_services" \
+  -e OAUTH_TOKEN_ENCRYPTION_KEY="$OAUTH_TOKEN_ENCRYPTION_KEY" \
+  -e OAUTH_STATE_SECRET="$OAUTH_STATE_SECRET" \
+  twisted-services
+```
+
+The image uses `/app`, which is created during the image build, and starts with
+`python -m twisted_services.main`. The application creates its tables in the
+configured PostgreSQL database during startup and does not need to write to the
+container filesystem.
+
 ## HTTP endpoints
 
 ### Slack OAuth
